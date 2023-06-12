@@ -1,0 +1,530 @@
+---
+title: "Exploring Sentiment Analysis: A Case Study of IMDB Movie Reviews"
+author: "Devin Fonseca, Rabail Adwani, and Keanan Milton"
+date: "2023-03-27"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(tidytext)
+library(textstem)
+library(caret)
+library(xgboost)
+library(randomForest)
+library(e1071)
+library(keras)
+library(tm)
+
+reviews_df <- read_csv("F:/MSDS/Statistical Computing/Project/Data/IMDBDataset.csv")
+
+table(reviews_df$sentiment)
+
+set.seed(129)
+data <- reviews_df
+
+
+
+# Convert reviews into tidy text format
+tidy_reviews <- data %>%
+  unnest_tokens(word, review)
+
+# Remove stop words
+data_stop_words <- stop_words
+tidy_reviews_clean <- tidy_reviews %>%
+  anti_join(data_stop_words, by = "word")
+
+# Stem words after removing stop words
+tidy_reviews_clean$word <- sapply(tidy_reviews_clean$word, function(x) {
+  paste0(stem_words(words(x)), collapse = " ")
+})
+```
+
+Here we load the necessary libraries and data and begin the preprocessing stage.Text data requires careful preprocessing to ensure that our model can make the most of it. We remove punctuation and stop words because they're common and do not provide valuable information for sentiment analysis. Stemming is performed to reduce the dimensionality of our data and to group together different forms of the same word, which helps in capturing the sentiment effectively.
+
+
+Next we will calculate the most frequent words for both positive and negative reviews.
+
+```{r}
+# Calculate term frequencies for each word in positive and negative reviews
+word_counts <- tidy_reviews_clean %>%
+  group_by(sentiment, word) %>%
+  summarise(term_frequency = n(), .groups = "drop") %>%
+  arrange(sentiment, desc(term_frequency))
+
+# Identify the most frequent associated words for positive and negative movie reviews
+top_words <- word_counts %>%
+  group_by(sentiment) %>%
+  top_n(10, term_frequency)
+
+top_words
+
+```
+
+The top words in this dataset aren't surprising, they are mostly movie related words. One thing we weren't expecting is the word "br". The next section we will try to identify what this word is and if it is worth removing.
+
+```{r}
+#Trying to figure out the word "br"
+
+#Rerun this without removing stop words and without stemming
+word_counts2 <- tidy_reviews %>%
+  group_by(sentiment, word) %>%
+  summarise(term_frequency = n(), .groups = "drop") %>%
+  arrange(sentiment, desc(term_frequency))
+
+# Identify the most frequent words/features for positive and negative movie reviews
+top_words2 <- word_counts2 %>%
+  group_by(sentiment) %>%
+  top_n(10, term_frequency)
+
+top_words2
+
+
+```
+
+"br" is present despite not removing stop words or stems. We can conclude that "br" is a word found in the dataset that isn't an artifact of stemming or removing stop words. 
+
+Next is finding out the context of how "br" fits in the text by identifying which sentences it appears in.
+
+```{r}
+
+# Load library
+library(stringr)
+
+# Define a function to extract sentences containing the target word
+extract_sentences <- function(text, target_word) {
+  sentences <- str_split(text, boundary("sentence"))[[1]]
+  target_sentences <- sentences[str_detect(sentences, regex(paste0("\\b", target_word, "\\b"), ignore_case = TRUE))]
+  return(target_sentences)
+}
+
+# Find sentences containing the word "br"
+target_word <- "br"
+sentences_with_target_word <- data %>%
+  mutate(sentences = map(review, extract_sentences, target_word = target_word)) %>%
+  select(sentiment, review, sentences) %>%
+  unnest(sentences)
+
+# View sentences containing the word "br"
+sentences_with_target_word
+
+
+```
+We found that "br" represents <br /> which is a line break in the review. Now that we know what this is we can drop it.
+
+```{r}
+
+# Remove stop words
+data_stop_words <- stop_words
+tidy_reviews_clean <- tidy_reviews %>%
+  anti_join(data_stop_words, by = "word")
+
+
+# Filter out the word "br"
+tidy_reviews_clean <- tidy_reviews_clean %>%
+  filter(word != "br")
+
+# Stem words after removing stop words
+tidy_reviews_clean$word <- sapply(tidy_reviews_clean$word, function(x) {
+  paste0(stem_words(words(x)), collapse = " ")
+})
+
+head(tidy_reviews_clean)
+
+```
+
+In the head of the clean data above, there is a number that has been considered as a word. Lets remove numbers and any special characters in the dataset.
+
+```{r}
+
+# Removing any numbers or special characters
+tidy_reviews_clean <- tidy_reviews_clean %>%
+  filter(!grepl("[^[:alpha:]]", word))
+
+head(tidy_reviews_clean)
+
+write.csv(tidy_reviews_clean, "imdb_clean.csv", row.names = FALSE)
+
+```
+
+
+We will revisit the most frequent words now that the data has been properly cleaned.
+```{r}
+
+# Calculate term frequencies for each word in positive and negative reviews
+word_counts <- tidy_reviews_clean %>%
+  group_by(sentiment, word) %>%
+  summarise(term_frequency = n(), .groups = "drop") %>%
+  arrange(sentiment, desc(term_frequency))
+
+# Identify the most strongly associated words/features for positive and negative movie reviews
+top_words <- word_counts %>%
+  group_by(sentiment) %>%
+  top_n(10, term_frequency)
+
+top_words
+
+```
+
+
+```{r}
+
+# Load ggwordcloud library
+library(ggwordcloud)
+
+# Create separate word clouds for positive and negative reviews
+word_cloud <- word_counts %>%
+  top_n(100, term_frequency) %>%
+  ggplot(aes(label = word, size = term_frequency, color = sentiment)) +
+  geom_text_wordcloud_area() +
+  scale_size_area(max_size = 20) +
+  theme_minimal() +
+  facet_wrap(~sentiment) +
+  labs(title = "Term frequency Word Clouds by Sentiment",
+       x = NULL, y = NULL)
+
+word_cloud
+
+```
+In this word cloud, the size of the words represents their frequency in the dataset. Larger words appear more often in the reviews, while smaller words are less frequent. The words are also colored based on their sentiment—words in the positive sentiment group are blue, while words in the negative sentiment group are red. By looking at this word cloud, you can quickly identify the most frequently used words in positive and negative movie reviews, in this case it appears the most frequently occurring terms are film and movie and they appear in both categories. To see which words are more important in distinguishing between positive and negative movie reviews we will calculate the term frequency-inverse document frequency.
+
+
+# TF-IDF
+```{r}
+tf_idf_reviews <- tidy_reviews_clean %>%
+  count(sentiment, word) %>%
+  bind_tf_idf(word, sentiment, n) %>%
+  arrange(desc(tf_idf))
+
+head(tf_idf_reviews)
+
+idf_by_sentiment_word_cloud <- tf_idf_reviews %>%
+  group_by(sentiment) %>%
+  slice_max(tf_idf, n = 30) %>%
+  ggplot(aes(label = word, size = tf_idf, color = sentiment)) +
+  geom_text_wordcloud_area() +
+  theme_minimal() +
+  facet_wrap(~sentiment) +
+  labs(title = "TF-IDF Weighted Word Clouds by Sentiment",
+       x = NULL, y = NULL)
+
+idf_by_sentiment_word_cloud
+```
+
+These words could be considered strong indicators of sentiment in movie reviews, as they show a significant difference in usage between positive and negative reviews. The problem we found with the TF-IDF words is they appear to be movie titles or segments of movie titles. It makes sense that the word Ponyo would be a good predictor of positive sentiment as it was an acclaimed movie but these words aren't helpful for predicting sentiment for other movies.
+
+
+Next we will explore Latent Dirichlet Allocation to see if topics can easily be distinguished in movie reviews.
+
+# Latent Dirichlet Allocation
+```{r}
+library(topicmodels)
+
+
+# Add review_id to the tidy_reviews_clean dataframe
+tidy_reviews_clean <- tidy_reviews_clean %>% mutate(review_id = factor(row_number()))
+
+# Count the words for each review
+review_word_counts <- tidy_reviews_clean %>%
+  group_by(review_id, word) %>%
+  summarise(n = n(), .groups = "drop")
+
+# Create the Document-Term Matrix using review_word_counts
+document_term_matrix <- review_word_counts %>%
+  cast_dtm(document = review_id,
+           term = word,
+           value = n)
+
+# Run LDA analysis on the Document-Term Matrix
+set.seed(29)
+reviews_lda <- LDA(document_term_matrix,
+                    k = 8,
+                    control = list(seed = 29))
+
+# Visualize the topics found
+review_topics <- tidy(reviews_lda, matrix = "beta")
+
+top_terms <- review_topics %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 10) %>%
+  mutate(topic = factor(topic))
+
+top_terms %>%
+  ggplot(aes(beta, term, fill = topic)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free_y", ncol = 4)
+
+```
+
+The 8 topics seem to share a lot of the same words and they are all generic terms about movies. There is very little variation in words in each topic. This can be a sign that the model is not able to distinguish between distinct topics or themes within the reviews, this makes sense intuitively as movie reviews have a narrow range of topics. Given the little variation between the 8 topics, we decided pursuing LDA wouldn't be a productive use of time. 
+
+
+The next section focuses on modeling to predict sentiment. We focus and compare two models, Random Forest and XGBoost.
+
+# Modeling
+
+```{r}
+
+# Load the necessary libraries
+library(quanteda)
+library(ranger)
+library(tidymodels)
+
+# function to clean the data
+
+vectorizer <- function(data){
+  
+  # Add unique identifiers for each review
+  data <- data %>% mutate(id = row_number())
+
+  # Convert reviews into tidy text format with identifiers
+  tidy_reviews <- data %>%
+    unnest_tokens(word, review) %>%
+    select(id, word)
+
+  # Remove stop words
+  tidy_reviews <- tidy_reviews %>%
+    anti_join(data_stop_words, by = "word")
+
+  # Remove the word "br"
+  tidy_reviews <- tidy_reviews %>% filter(word != "br")
+  
+  # Remove numbers and special characters
+  tidy_reviews<- tidy_reviews %>%
+    filter(!grepl("[^[:alpha:]]", word))
+
+  # Create Document-feature matrices for training and testing data
+  tidy_reviews_dfm <- tidy_reviews %>%
+    count(id, word) %>%
+    cast_dfm(id, word, n)
+
+  # Create training and testing datasets with document-feature matrix and sentiment labels
+  tidy_reviews_dfm <- data.frame(sentiment = data$sentiment, as.matrix(tidy_reviews_dfm))
+
+  tidy_reviews_dfm$sentiment <- as.factor(tidy_reviews_dfm$sentiment)
+  
+  return(tidy_reviews_dfm)
+}
+
+set.seed(123)
+imdb_cleaned <- data %>%
+  group_by(sentiment) %>%
+  sample_n(200) %>% 
+  ungroup() %>%
+  vectorizer()
+
+```
+
+Due to the limitations of R, we are only using 200 movie reviews as part of the modeling exercise. We scrapped the idea of using parsnip package as it doesn't handle large datasets well and can utilize more memory.
+
+# Train-test subsets
+
+```{r}
+
+# Create training and testing split
+set.seed(42)
+data_split <- initial_split(imdb_cleaned, prop = 0.8, strat=sentiment)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+```
+
+# Random Forest
+
+```{r}
+
+# Fit the model on the training data subset of 
+imdb_fit_rf <- ranger::ranger(
+  sentiment ~ .,
+  data = train_data,
+  num.trees = 500,
+  probability = TRUE,
+  importance = "impurity"
+)
+
+predictions_probs <- predict(imdb_fit_rf, data = test_data, type = "response")$predictions
+
+predicted_labels <- as.factor(ifelse(predictions_probs[, "positive"] > 0.5, "positive", "negative"))
+
+conf_matrix <- confusionMatrix(predicted_labels, test_data$sentiment)
+conf_matrix
+
+```
+Using a sample of only 200 movie reviews out of 50,000, we obtained an accuracy rate of 75% with random forest. We believe these results are pretty good for such a small sample size. 
+
+In summary, this model has an accuracy of 75% and a kappa of 0.4, indicating a moderate level of agreement between the model predictions and the actual values. It has a fairly balanced sensitivity and specificity, indicating that it performs similarly on both positive and negative classes. However, there's room for improvement, as perfect performance would have these metrics at 1.
+
+## Variable Importance
+
+```{r}
+
+# Extract variable importance scores
+var_imp <- imdb_fit_rf$variable.importance
+
+# Print the top 10 most important variables/words
+head(var_imp, 10)
+
+filtered_var_imp <- var_imp[!grepl("^X\\d+", names(var_imp))]
+
+# Print the top 10 most important variables/words without the "X" variables
+head(filtered_var_imp, 10)
+
+# Sort the filtered variable importance in decreasing order
+sorted_filtered_var_imp <- sort(filtered_var_imp, decreasing = TRUE)
+
+# Print the top 10 most important variables/words without the "X" variables
+head(sorted_filtered_var_imp, 10)
+
+
+
+```
+These top 10 words from var_imp represent the words that the model identified as the most important features in predicting sentiment (positive or negative) in the training data. These words are ranked by their importance score, which indicates how much they contribute to the model's accuracy in predicting sentiment. 
+
+
+```{r}
+# Creating variable importance plot for Random Forest
+var_imp_df <- data.frame(Word = names(sorted_filtered_var_imp), Importance = sorted_filtered_var_imp)
+top_20 <- head(var_imp_df, 20)
+ggplot(top_20, aes(x = reorder(Word, Importance), y = Importance, fill = Importance)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Top 20 Important Words - Random Forest", x = "Words", y = "Importance")
+
+```
+
+Out of the various techniques used above (term frequency, TF-IDF, LDA), the words found with the variable importance scores appear to be the words that you would expect to predict sentiment the best. For example terms like "bad", "waste", and "terrible" match our intuition on being good predictors for a negative review. 
+
+
+```{r}
+library(pROC)
+roc_obj <- roc(test_data$sentiment, predictions_probs[, "positive"])
+plot(roc_obj, main="ROC Curve for Random Forest Model")
+
+
+
+```
+ This curve is about to be expected for the results that we interpreted above. The top-left corner of the ROC space corresponds to a false positive rate of 0 and a true positive rate of 1, which is where a perfect classifier's ROC curve would reach. Our curve for this model is midway between the diagonal and the top-left corner, it suggests that the model's performance is somewhere between moderate and good. It's better than random guessing but it is not excellent and has room for improvement.
+ 
+ 
+Next we will run a xgboost model and compare the results to the random forest model.
+
+# xgboost
+
+```{r}
+
+library(xgboost)
+
+set.seed(876)
+
+# Convert the target to 0 or 1
+train_data_gbm <- train_data %>% mutate(sentiment = ifelse(sentiment == "positive", 1, 0))
+test_data_gbm <- test_data %>% mutate(sentiment = ifelse(sentiment == "positive", 1, 0))
+
+# Transform train and test to predictors only matrix
+matrix_predictors.train <- as.matrix(train_data_gbm)[,-1]
+matrix_predictors.test <- as.matrix(test_data_gbm)[,-1]
+
+# Set up features and label in a Dmatrix form for xgboost
+
+## Train
+pred.train.gbm <- data.matrix(matrix_predictors.train)
+imdb.train.gbm <- as.numeric(as.character(train_data_gbm$sentiment))
+dtrain <- xgb.DMatrix(data = pred.train.gbm, label=imdb.train.gbm)
+
+## Test
+pred.test.gbm <- data.matrix(matrix_predictors.test)
+imdb.test.gbm <- as.numeric(as.character(test_data_gbm$sentiment))
+dtest <- xgb.DMatrix(data = pred.test.gbm, label=imdb.test.gbm)
+
+# define watchlist
+watchlist <- list(train=dtrain, test=dtest)
+
+# define param
+param <- list(objective = "binary:logistic", eval_metric = "auc")
+
+# fit XGBoost model and display training and testing data at each round
+model.xgb <- xgb.train(param, dtrain, nrounds = 50, watchlist)
+
+# make predictions on the test set
+pred.prob = predict(model.xgb, pred.test.gbm)
+prediction <- as.numeric(pred.prob > 0.5)
+
+# confusion matrix
+conf_matrix <- confusionMatrix(factor(prediction), factor(imdb.test.gbm))
+conf_matrix
+
+```
+
+Using the same sample of 200 movie reviews, the XGBoost model obtained an accuracy rate of 60%. Although this is a significant decrease from the 75% accuracy rate achieved by the Random Forest model, the performance is still better than a model that makes random predictions, which would have an accuracy of 50%.
+
+The XGBoost model has a kappa of 0.2, indicating a slight agreement between the model predictions and the actual values. This is lower than the kappa of 0.4 obtained by the Random Forest model, suggesting that the XGBoost model's predictions are less consistent with the actual values.
+
+Sensitivity and specificity of the XGBoost model are 0.575 and 0.625, respectively. These values indicate that the model has a slightly higher performance on the positive class compared to the negative class. However, these values are lower than those of the Random Forest model, which achieved similar performance on both classes.
+
+In summary, the XGBoost model's performance is moderate but lower than the Random Forest model. With an accuracy of 60% and a kappa of 0.2, the XGBoost model offers room for improvement. Its sensitivity and specificity are not as balanced as those of the Random Forest model, suggesting that it may be less reliable for predicting negative review.
+
+
+
+
+Next we will examine the Variable Importance Plot
+```{r}
+# Extract variable importance
+importance_matrix <- xgb.importance(feature_names = colnames(pred.train.gbm), model = model.xgb)
+
+# Print the top 10 most important features
+head(importance_matrix, 10)
+
+# Create a data frame for the plot
+var_imp_df <- data.frame(Feature = importance_matrix$Feature, Importance = importance_matrix$Gain)
+
+# Filter the top 20 important features
+top_20 <- head(var_imp_df, 20)
+
+# Create a variable importance plot
+ggplot(top_20, aes(x = reorder(Feature, Importance), y = Importance, fill = Importance)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Top 20 Important Features - XGBoost", x = "Features", y = "Importance")
+
+
+```
+
+There is a lot of overlap with the words found in the Random Forest equivalent of this plot. That being said the Random Forest version probably gives a more accurate assessment of which words are better predictors of sentiment. 
+
+
+The final step we will take is plotting and interpreting a ROC Curve for the xgboost model. 
+```{r}
+# Calculate ROC
+roc_obj_xgb <- roc(imdb.test.gbm, pred.prob)
+
+# Plot ROC curve
+plot(roc_obj_xgb, main="ROC Curve for XGBoost Model")
+
+
+
+
+```
+The ROC curve for the XGBoost model is closer to the diagonal compared to the Random Forest model, this indicates that the XGBoost model's performance is less effective. The diagonal line represents a classifier that predicts outcomes no better than random chance. Thus, the closer the curve is to this diagonal, the less effective the model is at distinguishing between the positive and negative classes.
+
+While the XGBoost model still performs better than random guessing (as the curve is above the diagonal), its performance is not as good as the Random Forest model in this case. This is consistent with the lower accuracy we observed from the confusion matrix for the XGBoost model.
+
+
+# Conclusion
+
+In this project, we implemented a comprehensive approach to sentiment analysis on a set of IMDB movie reviews. The process started with data preprocessing, including tokenization, stop word removal, and cleaning of the text data. We then conducted an exploratory data analysis using techniques such as term frequency and TF-IDF to identify the most common and significant words in the reviews.
+
+We further utilized Latent Dirichlet Allocation (LDA) to try to discover hidden topics within the reviews, providing a deeper understanding of the underlying themes that might be associated with the sentiment of the reviews.
+
+Following this, we shifted to the modeling phase, where we employed Random Forest and XGBoost algorithms for sentiment prediction. The Random Forest model demonstrated superior performance with an accuracy of 75%, compared to the XGBoost model's accuracy of 60%.
+
+The top contributing words for each model were also examined, offering insights into the primary drivers for sentiment prediction. ROC curves were used to visualize the performance of the models, confirming the findings from the accuracy measurements.
+
+In summary, this project illustrates the power of NLP and machine learning techniques in sentiment analysis tasks. Although the models performed reasonably well, there is still potential for further improvement. Future work could explore larger sample sizes, the use of other models, parameter tuning, and feature engineering (length of review, the number of punctuation marks used, or the number of capital letters used) to enhance the predictive accuracy.
